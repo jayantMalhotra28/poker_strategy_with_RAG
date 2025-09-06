@@ -1,6 +1,6 @@
 streamlit
-python-docx
+python-docx==1.2.0
 openai
-faiss-cpu==1.7.4
+faiss-cpu==1.9.0.post1
 numpy
 eval7
