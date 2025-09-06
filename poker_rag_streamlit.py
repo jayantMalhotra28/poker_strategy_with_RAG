@@ -3,7 +3,7 @@ Streamlit Poker RAG Assistant
 File: poker_rag_streamlit.py
 
 Requirements:
-This file will read requirements from requirements.txt when deployed.
+- Reads from requirements.txt when deployed.
 
 Usage locally:
 1. pip install -r requirements.txt
@@ -20,25 +20,25 @@ import streamlit as st
 from docx import Document
 import numpy as np
 import faiss
-import openai
-import eval7
 import random
+import eval7
 from typing import List
+from openai import OpenAI
 
-# ---------- Helpers: text processing & embeddings ----------
+# ---------- Models ----------
 EMBED_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o"
 
-# Get key from Streamlit secrets or environment
+# ---------- API Key ----------
 if "OPENAI_API_KEY" in st.secrets:
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 else:
-    openai.api_key = os.environ.get("OPENAI_API_KEY")
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Poker RAG Assistant", layout="wide")
 st.title("Poker RAG Assistant — Streamlit")
 
-# Sidebar inputs
 with st.sidebar:
     st.header("Settings")
     top_k = st.number_input("Retriever top-k", value=3, min_value=1, max_value=10)
@@ -46,9 +46,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Instructions**: Upload a .docx playbook, enter cards, then press **Get Recommendation**.")
 
-# ---------- Upload playbook ----------
-uploaded_file = st.file_uploader("Upload Word playbook (.docx)", type=["docx"]) 
-
+# ---------- Helpers ----------
 @st.cache_data(show_spinner=False)
 def read_docx_bytes(bytes_data) -> str:
     from io import BytesIO
@@ -57,17 +55,9 @@ def read_docx_bytes(bytes_data) -> str:
     paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
     return "\n\n".join(paragraphs)
 
-@st.cache_resource
-def build_faiss_index(chunks: List[str], embeddings: np.ndarray):
-    d = embeddings.shape[1]
-    index = faiss.IndexFlatL2(d)
-    index.add(embeddings)
-    return index
-
 def chunk_text_simple(text: str, max_chars: int = 800) -> List[str]:
     paras = [p for p in text.split('\n\n') if p.strip()]
-    chunks = []
-    current = ""
+    chunks, current = [], ""
     for p in paras:
         if len(current) + len(p) + 2 <= max_chars:
             current = (current + '\n\n' + p).strip()
@@ -79,76 +69,63 @@ def chunk_text_simple(text: str, max_chars: int = 800) -> List[str]:
         chunks.append(current)
     return chunks
 
+@st.cache_resource
+def build_faiss_index(embeddings: np.ndarray):
+    d = embeddings.shape[1]
+    index = faiss.IndexFlatL2(d)
+    index.add(embeddings)
+    return index
+
 def embed_texts_openai(texts: List[str], model: str = EMBED_MODEL) -> np.ndarray:
-    resp = openai.Embedding.create(model=model, input=texts)
-    embs = np.array([r['embedding'] for r in resp['data']], dtype=np.float32)
+    resp = client.embeddings.create(model=model, input=texts)
+    embs = np.array([item.embedding for item in resp.data], dtype=np.float32)
     return embs
 
-# ---------- Poker utilities ----------
+# ---------- Poker Utilities ----------
 RANKS = '23456789TJQKA'
 SUITS = 'cdhs'
 DECK = [r + s for r in RANKS for s in SUITS]
 
 def parse_cards(text: str) -> List[str]:
-    text = text.strip()
-    if not text:
-        return []
     tokens = text.replace(',', ' ').split()
-    cards = []
-    for t in tokens:
-        if len(t) == 2:
-            cards.append(t.upper())
-    return cards
+    return [t.upper() for t in tokens if len(t) == 2]
 
 def monte_carlo_equity_eval7(hole: List[str], board: List[str], n_opps: int = 1, trials: int = 2000) -> float:
-    deck = [c for c in DECK if c.upper() not in [x.upper() for x in hole + board]]
-    wins = 0
-    ties = 0
+    deck = [c for c in DECK if c.upper() not in [*hole, *board]]
+    wins = ties = 0
     for _ in range(trials):
         random.shuffle(deck)
         idx = 0
-        opps = []
-        for _ in range(n_opps):
-            opps.append([deck[idx], deck[idx+1]])
-            idx += 2
-        needed = 5 - len(board)
-        new_board = board.copy()
-        for i in range(needed):
-            new_board.append(deck[idx]); idx += 1
-        our_hand = [eval7.Card(card) for card in hole + new_board]
-        our_score = eval7.evaluate(our_hand)
-        opp_scores = []
-        for o in opps:
-            o_hand = [eval7.Card(card) for card in o + new_board]
-            opp_scores.append(eval7.evaluate(o_hand))
+        opps = [[deck[idx + 2*i], deck[idx + 2*i +1]] for i in range(n_opps)]
+        idx += 2*n_opps
+        new_board = board.copy() + deck[idx:idx+(5-len(board))]
+        idx += 5 - len(board)
+        our_score = eval7.evaluate([eval7.Card(c) for c in hole + new_board])
+        opp_scores = [eval7.evaluate([eval7.Card(c) for c in o + new_board]) for o in opps]
         max_opp = max(opp_scores) if opp_scores else -1
-        if our_score > max_opp:
-            wins += 1
-        elif our_score == max_opp:
-            ties += 1
-    equity = (wins + ties * 0.5) / trials
-    return equity
+        if our_score > max_opp: wins += 1
+        elif our_score == max_opp: ties += 1
+    return (wins + ties*0.5)/trials
 
-# ---------- RAG prompt ----------
+# ---------- RAG ----------
 SYSTEM_PROMPT = (
     "You are a poker assistant. Use the supplied playbook excerpts to inform recommendations.\n"
-    "For each query return JSON with keys: action (fold/check/call/bet/raise), bet_size, equity_pct (0-100), reasoning, used_passages.\n"
-    "If playbook contradicts itself, highlight that. Prefer conservative play when uncertain.\n"
+    "Return JSON with keys: action (fold/check/call/bet/raise), bet_size, equity_pct (0-100), reasoning, used_passages.\n"
+    "Highlight contradictions and prefer conservative play when uncertain."
 )
 
 def build_rag_prompt(retrieved_passages: List[str], game_state: dict, equity: float) -> str:
     passages_block = "\n\n".join([f"- {p}" for p in retrieved_passages])
     user_block = (
         f"Retrieved passages:\n{passages_block}\n\n"
-        f"Game state:\nHole: {game_state['hole']}\nBoard: {game_state['board']}\nPot: {game_state['pot']}\n"
-        f"To_call: {game_state['to_call']}\nOpponents: {game_state['opponents']}\nEquity (sim): {equity:.2%}\n"
-        "Return the result as a JSON object only."
+        f"Game state:\nHole: {game_state['hole']}\nBoard: {game_state['board']}\n"
+        f"Pot: {game_state['pot']}\nTo_call: {game_state['to_call']}\nOpponents: {game_state['opponents']}\n"
+        f"Equity (sim): {equity:.2%}\nReturn JSON only."
     )
     return SYSTEM_PROMPT + "\n" + user_block
 
 # ---------- Main UI ----------
 col1, col2 = st.columns([1, 1])
-
 with col1:
     st.subheader("Hand & Table")
     hole_input = st.text_input("Hole cards (e.g. Ah Kd)")
@@ -162,36 +139,35 @@ with col2:
     run_btn = st.button("Get Recommendation")
     st.caption("Ensure OPENAI_API_KEY is set in Streamlit Cloud Secrets.")
 
-# Build index when playbook uploaded
+# ---------- Playbook Handling ----------
 index = None
 chunks = []
 embeddings = None
 
-if uploaded_file is not None:
+uploaded_file = st.file_uploader("Upload Word playbook (.docx)", type=["docx"])
+if uploaded_file:
     raw_text = read_docx_bytes(uploaded_file.getvalue())
     chunks = chunk_text_simple(raw_text, max_chars=800)
     st.success(f"Playbook loaded — {len(chunks)} chunks created.")
     try:
         with st.spinner('Embedding playbook...'):
             embeddings = embed_texts_openai(chunks)
-            index = build_faiss_index(chunks, embeddings)
+            index = build_faiss_index(embeddings)
         st.info('FAISS index ready.')
     except Exception as e:
         st.error(f"Embedding/index build failed: {e}")
         index = None
 
-# Retrieval
 def retrieve_top_k(query: str, k: int = 3):
-    if index is None or embeddings is None:
-        return []
+    if index is None or embeddings is None: return []
     q_emb = embed_texts_openai([query])[0]
     D, I = index.search(np.array([q_emb]), k)
-    retrieved = [chunks[i] for i in I[0] if i < len(chunks)]
-    return retrieved
+    return [chunks[i] for i in I[0] if i < len(chunks)]
 
+# ---------- Run Recommendation ----------
 if run_btn:
-    if not openai.api_key:
-        st.error("OPENAI_API_KEY not found. Set it in Streamlit Cloud Secrets.")
+    if not client.api_key:
+        st.error("OPENAI_API_KEY not found.")
     elif not uploaded_file:
         st.error("Please upload a .docx playbook first.")
     else:
@@ -219,7 +195,7 @@ if run_btn:
 
             st.markdown("### LLM Recommendation")
             try:
-                resp = openai.ChatCompletion.create(
+                resp = client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
@@ -228,7 +204,7 @@ if run_btn:
                     max_tokens=400,
                     temperature=0.2,
                 )
-                text = resp['choices'][0]['message']['content']
+                text = resp.choices[0].message.content
                 st.code(text, language='json')
             except Exception as e:
                 st.error(f"LLM call failed: {e}")
