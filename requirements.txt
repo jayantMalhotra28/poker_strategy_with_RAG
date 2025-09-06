@@ -1,0 +1,6 @@
+streamlit
+python-docx
+openai
+faiss-cpu==1.7.4
+numpy
+eval7
